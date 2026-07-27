@@ -27,7 +27,8 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-RUL_HORIZON = 500
+RUL_HORIZON = 180  # days; "Safe" (never reached) and anything beyond this saturate here.
+MIN_MSE_FLOOR = 5e-5
 SENTINEL_ALREADY_REACHED = -999.0
 
 # --- INDEPENDENT STATE INITIALIZATION ---
@@ -65,36 +66,43 @@ def get_available_channels(df):
         cols.remove('Thermo_Valve_Temperature_DeviationPct')
     return [str(c) for c in cols]
 
-def rolling_iqr_filter(data, window=20, factor=1.5):
+def rolling_iqr_filter(data, window=20, factor=1.5, center=True, keep_nans=True):
     def _filter_series(series):
         s = pd.to_numeric(series, errors='coerce')
         original_nans = s.isna()
-        Q1 = s.rolling(window=window, center=True, min_periods=1).quantile(0.25)
-        Q3 = s.rolling(window=window, center=True, min_periods=1).quantile(0.75)
+        Q1 = s.rolling(window=window, center=center, min_periods=1).quantile(0.25)
+        Q3 = s.rolling(window=window, center=center, min_periods=1).quantile(0.75)
         IQR = Q3 - Q1
         lower_bound, upper_bound = Q1 - (factor * IQR), Q3 + (factor * IQR)
         mask = (s >= lower_bound) & (s <= upper_bound)
         s_filtered = s.where(mask, np.nan).interpolate(method='linear', limit_direction='both')
-        s_filtered.loc[original_nans] = np.nan
+        if keep_nans:
+            s_filtered.loc[original_nans] = np.nan
         return s_filtered
     return _filter_series(data) if isinstance(data, pd.Series) else data.apply(_filter_series) if isinstance(data, pd.DataFrame) else None
 
 @st.cache_data
-def load_my_sensor_data(df, col='32', outlier_factor=1.5, outlier_window=20):
+def load_my_sensor_data(df, col='32', outlier_factor=1.5, outlier_window=20, target_freq='1D'):
     freq = '4h'
     df_resampled = df.resample(freq).mean(numeric_only=True)
-    if col not in df_resampled.columns: return pd.Series(), pd.Series(), pd.Series()
-    
+    if col not in df_resampled.columns:
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+
     df_select = df_resampled[[col]].copy().interpolate(method='time', limit=1)
     df_select = rolling_iqr_filter(df_select, factor=outlier_factor, window=outlier_window)
 
-    window = int(1 * 24 / 4)
+    window = int(24 / 4)  # 1 Day
     df_select[f'{col}_max'] = df_select[col].rolling(window=window * 5, min_periods=1).max()
     df_select[f'{col}_max_ema'] = df_select[f'{col}_max'].ewm(span=window * 5, adjust=False, ignore_na=True).mean()
 
-    df_daily = df_select.resample('D').mean()
-    df_daily['elapsed_days'] = (df_daily.index - df_daily.index.min()).days
-    return df_daily[f'{col}_max_ema'], df_daily[f'{col}_max'], df_daily['elapsed_days']
+    # Resample to the requested target frequency
+    df_target = df_select.resample(target_freq).mean(numeric_only=True)
+
+    # Fractional elapsed days via total_seconds (avoids integer-day truncation)
+    origin = df_target.index.min()
+    df_target['elapsed_days'] = (df_target.index - origin).total_seconds() / 86400.0
+
+    return df_target[f'{col}_max_ema'], df_target[f'{col}_max'], df_target['elapsed_days']
 
 @st.cache_data
 def process_all_channels(df, outlier_factor, outlier_window):
@@ -105,25 +113,105 @@ def process_all_channels(df, outlier_factor, outlier_window):
         if not elapsed.empty: all_data[ch] = {'smooth': smooth, 'raw': raw, 'elapsed': elapsed}
     return all_data
 
+# ---------------------------------------------------------
+# 1. The Standardized Mathematical Models
+# ---------------------------------------------------------
 def linear_model(t, m, c): return m * t + c
 def logarithmic_model(t, a, b, d): return a * np.log1p(np.clip(b * t, 0, np.inf)) + d
 def shifted_exponential_model(t, a, b, t0, d): return a * np.exp(np.clip(b * (t - t0), -50, 50)) + d
 def softplus_model(t, a, b, t0, d): return a * np.logaddexp(0, b * (t - t0)) + d
 def gompertz_model(t, a, b, c, d): return a * np.exp(-b * np.exp(-c * t)) + d
+def arctan_model(t, L, k, t0, d): return L * (np.arctan(k * (t - t0)) / np.pi + 0.5) + d
+def linear_sine_model(t, a, b, c, m, d):
+    # a: amplitude, b: frequency, c: phase shift, m: linear slope, d: vertical offset
+    return a * np.sin(b * t + c) + (m * t + d)
 
-AVAILABLE_MODELS = ['Linear', 'Logarithmic', 'Shifted Exponential', 'Softplus', 'Gompertz']
+# Ordered by requested default priority (Highest to Lowest)
+AVAILABLE_MODELS = [
+    'Linear',
+    'Logarithmic',
+    'Trending Sine',
+    'Softplus',
+    'Shifted Exponential',
+    #'Gompertz',
+]
 
+# ---------------------------------------------------------
+# 1a. Analytical Jacobians (Exact Partial Derivatives)
+# ---------------------------------------------------------
+def linear_jac(t, m, c):
+    dm = t
+    dc = np.ones_like(t)
+    return np.column_stack((dm, dc))
+
+def logarithmic_jac(t, a, b, d):
+    u = np.clip(b * t, 0, np.inf)
+    da = np.log1p(u)
+    db = (a * t) / (1 + u)
+    db[b * t < 0] = 0.0
+    dd = np.ones_like(t)
+    return np.column_stack((da, db, dd))
+
+def shifted_exponential_jac(t, a, b, t0, d):
+    u = np.clip(b * (t - t0), -50, 50)
+    exp_u = np.exp(u)
+    da = exp_u
+    db = a * (t - t0) * exp_u
+    dt0 = -a * b * exp_u
+    clip_mask = (b * (t - t0) <= -50) | (b * (t - t0) >= 50)
+    db[clip_mask] = 0.0
+    dt0[clip_mask] = 0.0
+    dd = np.ones_like(t)
+    return np.column_stack((da, db, dt0, dd))
+
+def softplus_jac(t, a, b, t0, d):
+    x = b * (t - t0)
+    da = np.logaddexp(0, x)
+    sigmoid = np.where(x >= 0,
+                       1.0 / (1.0 + np.exp(-x)),
+                       np.exp(x) / (1.0 + np.exp(x)))
+    db = a * (t - t0) * sigmoid
+    dt0 = -a * b * sigmoid
+    dd = np.ones_like(t)
+    return np.column_stack((da, db, dt0, dd))
+
+def gompertz_jac(t, a, b, c, d):
+    u = np.exp(-c * t)
+    E = np.exp(-b * u)
+    da = E
+    db = -a * u * E
+    dc = a * b * t * u * E
+    dd = np.ones_like(t)
+    return np.column_stack((da, db, dc, dd))
+
+def linear_sine_jac(t, a, b, c, m, d):
+    phase = b * t + c
+    cos_p = np.cos(phase)
+    da = np.sin(phase)
+    db = a * t * cos_p
+    dc = a * cos_p
+    dm = t
+    dd = np.ones_like(t)
+    return np.column_stack((da, db, dc, dm, dd))
+
+# ---------------------------------------------------------
+# 1b. CENTRALIZED MODEL CONFIG (single source of truth)
+# ---------------------------------------------------------
 def build_models_config(y_min, y_max, y_range):
     d_lo, d_hi = y_min - 0.2, y_max + 0.2
     return {
-        'Linear': {'func': linear_model, 'p0': [y_range, y_min], 'bounds': ([-np.inf, d_lo], [np.inf, d_hi])},
-        'Logarithmic': {'func': logarithmic_model, 'p0': [y_range * 0.5, 10.0, y_min], 'bounds': ([1e-5, 1e-5, d_lo], [y_range * 10.0, 500.0, d_hi])},
-        'Shifted Exponential': {'func': shifted_exponential_model, 'p0': [y_range * 0.1, 5.0, 0.5, y_min], 'bounds': ([1e-5, 0.01, 0.0, d_lo], [y_range * 5.0, 50.0, 1.0, d_hi])},
-        'Softplus': {'func': softplus_model, 'p0': [y_range * 0.5, 10.0, 0.5, y_min], 'bounds': ([1e-3, 1e-3, 0.0, d_lo], [y_range * 10.0, 500.0, 1.0, d_hi])},
-        'Gompertz': {'func': gompertz_model, 'p0': [y_range * 1.1, 1.0, 0.1, y_min], 'bounds': ([y_range * 0.8, 0.01, 1e-4, d_lo], [max(2.0, y_range * 2.2), 100.0, 50.0, d_hi])},
+        'Linear': {'func': linear_model, 'jac': linear_jac, 'p0': [y_range, y_min], 'bounds': ([-np.inf, d_lo], [np.inf, d_hi])},
+        'Logarithmic': {'func': logarithmic_model, 'jac': logarithmic_jac, 'p0': [y_range * 0.5, 10.0, y_min], 'bounds': ([1e-5, 1e-5, d_lo], [y_range * 10.0, 500.0, d_hi])},
+        'Shifted Exponential': {'func': shifted_exponential_model, 'jac': shifted_exponential_jac, 'p0': [y_range * 0.1, 5.0, 0.5, y_min], 'bounds': ([1e-5, 0.01, 0.0, d_lo], [y_range * 5.0, 50.0, 1.0, d_hi])},
+        'Softplus': {'func': softplus_model, 'jac': softplus_jac, 'p0': [y_range * 0.5, 10.0, 0.5, y_min], 'bounds': ([1e-3, 1e-3, 0.0, d_lo], [y_range * 10.0, 500.0, 1.0, d_hi])},
+        'Gompertz': {'func': gompertz_model, 'jac': gompertz_jac, 'p0': [y_range * 1.1, 1.0, 0.1, y_min], 'bounds': ([y_range * 0.8, 0.01, 1e-4, d_lo], [max(2.0, y_range * 2.2), 100.0, 50.0, d_hi])},
+        'Trending Sine': {'func': linear_sine_model, 'jac': linear_sine_jac, 'p0': [y_range * 0.1, 3 * 2 * np.pi, 0.0, y_range, y_min], 'bounds': ([1e-5, 2 * np.pi, -np.pi, -np.inf, d_lo], [y_range * 2.0, 10 * np.pi, np.pi, np.inf, d_hi])},
     }
 
-def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=None, warm_start=None, maxfev=10000):
+# ---------------------------------------------------------
+# 2. Master Fitting Function (AIC & Priority Router)
+# ---------------------------------------------------------
+def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=None, warm_start=None, maxfev=10000, min_mse_floor=MIN_MSE_FLOOR):
     time_arr, sensor_arr = np.asarray(time_data), np.asarray(sensor_data)
     t_max = np.max(time_arr)
     time_norm = time_arr / t_max if t_max > 0 else time_arr
@@ -131,18 +219,30 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
     if valid_mask.sum() < 10: return {}, {}
     t_fit, y_fit = time_norm[valid_mask], sensor_arr[valid_mask]
     y_min, y_max = float(np.min(y_fit)), float(np.max(y_fit))
-    
+
     models_config, results = build_models_config(y_min, y_max, y_max - y_min), {}
-    for name, config in models_config.items():
+    for name in AVAILABLE_MODELS:
+        if name not in models_config: continue
+        config = models_config[name]
         try:
             p0 = config['p0']
-            params, _ = curve_fit(config['func'], t_fit, y_fit, p0=p0, bounds=config['bounds'], method='trf', maxfev=maxfev)
+            k = len(p0)
+            if warm_start is not None and name in warm_start and warm_start[name] is not None:
+                try: p0 = np.clip(warm_start[name], config['bounds'][0], config['bounds'][1])
+                except Exception: p0 = config['p0']
+            params, _ = curve_fit(config['func'], t_fit, y_fit, p0=p0, jac=config.get('jac'), bounds=config['bounds'], method='trf', maxfev=maxfev)
             preds = config['func'](t_fit, *params)
-            y_eval = y_fit[-eval_window:] if eval_window and eval_window < len(y_fit) else y_fit
-            preds_eval = preds[-eval_window:] if eval_window and eval_window < len(preds) else preds
+            if eval_window is not None and eval_window < len(y_fit):
+                y_eval, preds_eval = y_fit[-eval_window:], preds[-eval_window:]
+            else:
+                y_eval, preds_eval = y_fit, preds
+            n = len(y_eval)
             mse = mean_squared_error(y_eval, preds_eval)
-            results[name] = {'params': params, 'mse': mse, 'aic': len(y_eval) * np.log(mse + 1e-10) + 2 * len(p0), 'func': config['func']}
-        except: results[name] = {'params': None, 'mse': float('inf'), 'aic': float('inf'), 'func': config['func']}
+            # Tail-weighted pseudo-AIC with MSE floor (prevents log-domain blow-ups on near-perfect fits)
+            aic = n * np.log(max(mse, min_mse_floor)) + 2 * k
+            results[name] = {'params': params, 'mse': mse, 'aic': aic, 'func': config['func']}
+        except Exception as e:
+            results[name] = {'params': None, 'mse': float('inf'), 'aic': float('inf'), 'error': str(e), 'func': config['func']}
 
     valid_results = {n: d for n, d in results.items() if d['aic'] != float('inf')}
     if not valid_results: return {}, results
