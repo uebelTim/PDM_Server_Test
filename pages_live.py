@@ -37,8 +37,9 @@ from live_features import build_shutter_figures, find_shutter_columns
 # =========================================================
 # DATABASE REGISTRY
 # =========================================================
-# The three live sources. `password` falls back to st.secrets so nothing is hardcoded
-# in the file; edit `key`/`label`/connection fields to match your environment.
+# The three live sources. All databases share ONE username/password, read from
+# st.secrets (DB_USER / DB_PASSWORD) so nothing is hardcoded in the file.
+# Only the database id, label and cache file differ per source.
 def get_db_registry():
     def _secret(name, default=None):
         try:
@@ -46,37 +47,27 @@ def get_db_registry():
         except Exception:
             return default
 
+    shared_user = _secret("DB_USER", "sa")
+    shared_password = _secret("DB_PASSWORD", None)
+
+    sources = [
+        {"key": "alunorf_1", "label": "Alunorf 1", "database": "136816"},
+        {"key": "alunorf_2", "label": "Alunorf 2", "database": "136817"},
+        {"key": "alunorf_3", "label": "Alunorf 3", "database": "136818"},
+    ]
+
     return [
         {
-            "key": "alunorf_1",
-            "label": "Alunorf 1",
+            "key": s["key"],
+            "label": s["label"],
             "server": "dev-mars",
-            "database": "136816",
+            "database": s["database"],
             "table": "ValuesHotMillProfileGaugeService",
-            "username": _secret("DB1_USER", "sa"),
-            "password": _secret("DB1_PASSWORD", None),
-            "cache_file": "alunorf_1_cache.csv",
-        },
-        {
-            "key": "alunorf_2",
-            "label": "Alunorf 2",
-            "server": "dev-mars",
-            "database": "136817",
-            "table": "ValuesHotMillProfileGaugeService",
-            "username": _secret("DB2_USER", "sa"),
-            "password": _secret("DB2_PASSWORD", None),
-            "cache_file": "alunorf_2_cache.csv",
-        },
-        {
-            "key": "alunorf_3",
-            "label": "Alunorf 3",
-            "server": "dev-mars",
-            "database": "136818",
-            "table": "ValuesHotMillProfileGaugeService",
-            "username": _secret("DB3_USER", "sa"),
-            "password": _secret("DB3_PASSWORD", None),
-            "cache_file": "alunorf_3_cache.csv",
-        },
+            "username": shared_user,
+            "password": shared_password,
+            "cache_file": f"{s['key']}_cache.csv",
+        }
+        for s in sources
     ]
 
 
@@ -225,7 +216,7 @@ def poll_one_db(cfg, params_ui):
     state = _db_state(cfg["key"])
 
     if cfg["password"] is None:
-        state["conn_error"] = "No password configured (set DBx_PASSWORD in secrets)."
+        state["conn_error"] = "No password configured (set DB_PASSWORD in secrets)."
         return
 
     try:
