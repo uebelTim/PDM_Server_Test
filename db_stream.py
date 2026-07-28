@@ -1,127 +1,167 @@
 """
-db_stream.py — Streamlit-safe SQL Server streaming helpers.
+db_stream.py — Streamlit-safe live acquisition on top of the export pipeline.
 
-This is a reworked version of the original `diagnostic_utils.py` streaming code.
+The live monitor pulls and shapes data with the SAME code the historical backtest
+uses (db_export). Each acquisition:
 
-WHY THE REWORK:
-    The original `stream_new_data()` is a blocking infinite generator
-    (`while True: ... time.sleep(...)`). That model cannot run inside Streamlit:
-    the script must hand control back to the runtime on every cycle so the UI can
-    render, toggles work, and the loop can be stopped. Here the *cadence* is owned
-    by the Streamlit page (via st.rerun on a timer); this module only exposes a
-    single non-blocking "poll once" call plus the initial full-pull/cache logic.
+    export_table_to_csv(use_decode=True, decode_function="CPDecode", file_format="csv")
+        -> decoded LONG csv (DateTime, CPScanIdx, X, Y, ...)
+    format_channel_df(...)  -> WIDE frame: DateTime + ~80-100 numeric channel columns
 
-BUG FIXES vs. the original snippet:
-    1. Blocking loop removed  -> poll_new_data() returns immediately.
-    2. Engines are cached per-DB (@st.cache_resource) instead of rebuilt per poll.
-    3. CSV append reindexes to the cache header first, so column-order drift or a
-       missing column can never silently misalign the cache file.
-    4. Buffer is sorted by DateTime before any diff/rolling math downstream.
-    5. Watermark handling documented: WHERE DateTime > wm is *strictly* greater, so
-       rows sharing the exact max timestamp are intentionally not re-fetched.
-    6. Errors are returned as structured status, not just printed, so each DB tab
-       can surface its own connection state.
-    7. Credentials are passed in (from config / st.secrets), never hardcoded.
+That wide frame is the live buffer, and pages_live runs process_all_channels on it
+exactly like the simulator runs it on an uploaded CSV.
+
+WHY A "POLL ONCE" MODEL:
+    The original streaming code was a blocking `while True: ... sleep()` generator,
+    which cannot run inside Streamlit — the script must return control every cycle so
+    the UI renders and the loop can be stopped. Here the cadence is owned by the page
+    (st.rerun on a timer); this module only exposes the initial history load plus a
+    single non-blocking incremental pull.
+
+WATERMARK:
+    build_sql_for_export filters with `v.DateTime >= :dt_filter`, so a poll re-fetches
+    the watermark row itself; we drop rows <= watermark after formatting so only
+    strictly-new scans are appended.
 """
 from __future__ import annotations
 
 import os
 import pandas as pd
-import streamlit as st
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine.url import URL
+
+import db_export as dbx
 
 
-# ----------------------------
-# Connection builder (unchanged API, kept for parity with diagnostic_utils)
-# ----------------------------
-def build_connection_url(
-    server,
-    database,
-    username=None,
-    password=None,
-    driver="ODBC Driver 18 for SQL Server",
-    trusted=False,
-    encrypt="yes",
-    trust_cert="yes",
-    port=None,
-):
-    """Build a SQLAlchemy URL for SQL Server via the mssql+pyodbc dialect."""
-    host = server if port is None else f"{server},{port}"
-    query = {"driver": driver, "Encrypt": encrypt, "TrustServerCertificate": trust_cert}
-    if trusted:
-        query["Trusted_Connection"] = "yes"
-        return URL.create("mssql+pyodbc", host=host, database=database, query=query)
-    return URL.create(
-        "mssql+pyodbc",
-        username=username,
-        password=password,
-        host=host,
-        database=database,
-        query=query,
+# Decode settings shared by every live pull (mirrors the historical export script).
+DECODE_FUNCTION = "CPDecode"
+BLOB_COLUMN = "Delta"
+SORT_COLUMN = "X"
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _decoded_base(cfg, suffix: str) -> str:
+    """Base path (no extension) for a decoded long-csv scratch file for this DB."""
+    d = os.path.dirname(cfg["cache_file"]) or "."
+    return os.path.join(d, f"{cfg['key']}_decoded_{suffix}")
+
+
+def _pull_decoded_long(cfg, output_base, datetime_filter=None, chunksize=None) -> str:
+    """
+    Run the CPDecode export to a LONG csv via the shared export pipeline and return
+    the written path (output_base + '.csv').
+    """
+    _ensure_parent_dir(output_base)
+    return dbx.export_table_to_csv(
+        server=cfg["server"],
+        database=cfg["database"],
+        output_csv_path=output_base,
+        username=cfg["username"],
+        password=cfg["password"],
+        backend="sqlalchemy",
+        file_format="csv",
+        use_decode=True,
+        decode_function=DECODE_FUNCTION,
+        blob_column=BLOB_COLUMN,
+        table=cfg["table"],
+        datetime_filter=datetime_filter,
+        chunksize=chunksize,
+        sort_column=SORT_COLUMN,
     )
 
 
-@st.cache_resource(show_spinner=False)
-def get_engine(server, database, username, password, driver="ODBC Driver 18 for SQL Server",
-               trusted=False, encrypt="yes", trust_cert="yes", port=None):
+def _long_csv_to_wide(long_csv_path: str) -> pd.DataFrame:
     """
-    Cached engine, one per unique connection tuple. @st.cache_resource keeps a single
-    engine alive across reruns so we don't reopen a pool on every poll. The cache key is
-    the full argument set, so different DBs get different engines automatically.
+    Read a decoded long csv and format it to the wide channel frame the RUL engine
+    expects: a DateTime column plus one string-named column per chamber (X), values=Y.
     """
-    url = build_connection_url(server, database, username, password, driver,
-                               trusted, encrypt, trust_cert, port)
-    # fast_executemany only helps bulk INSERTs; harmless for our read-only use.
-    return create_engine(url, fast_executemany=True)
+    long_df = pd.read_csv(long_csv_path)
+    if long_df.empty:
+        return pd.DataFrame(columns=["DateTime"])
+
+    wide = dbx.format_channel_df(long_df)          # DateTime-indexed, columns = X
+    if wide is None or wide.empty:
+        return pd.DataFrame(columns=["DateTime"])
+
+    wide = wide.reset_index()                      # DateTime back to a plain column
+    wide.columns = ["DateTime"] + [str(c) for c in wide.columns[1:]]
+    wide["DateTime"] = pd.to_datetime(wide["DateTime"])
+    return wide.sort_values("DateTime").reset_index(drop=True)
 
 
-def get_dynamic_columns(engine, table_name, search_string, include_datetime=True):
-    """Return all column names in `table_name` whose name contains `search_string`."""
-    query = text(
-        """
-        SELECT COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = :table
-          AND COLUMN_NAME LIKE :search
-        """
-    )
-    with engine.connect() as conn:
-        df_cols = pd.read_sql_query(query, conn, params={"table": table_name, "search": f"%{search_string}%"})
-    found = df_cols["COLUMN_NAME"].tolist()
-    if include_datetime and "DateTime" not in found:
-        found.insert(0, "DateTime")
-    return found
+def load_or_fetch_history(cfg, chunksize=200_000) -> pd.DataFrame:
+    """
+    Warm-start a DB's live buffer: read the wide CSV cache if present, else pull the
+    full decoded history once (CPDecode export -> format_channel_df), cache the wide
+    result, and return it. Always DateTime-sorted with string channel columns.
+    """
+    cache_file = cfg["cache_file"]
+    if os.path.exists(cache_file):
+        df = pd.read_csv(cache_file, parse_dates=["DateTime"])
+        df.columns = [str(c) for c in df.columns]
+        if "DateTime" in df.columns:
+            df = df.sort_values("DateTime").reset_index(drop=True)
+        return df
+
+    _ensure_parent_dir(cache_file)
+    long_path = _pull_decoded_long(cfg, _decoded_base(cfg, "history"), datetime_filter=None, chunksize=chunksize)
+    wide = _long_csv_to_wide(long_path)
+    wide.to_csv(cache_file, index=False)
+    return wide
 
 
-def load_or_fetch_entire_database(engine, table, cache_filename="full_database_cache.csv"):
+def poll_new_data(cfg, watermark, max_rows=None):
     """
-    Load a local CSV cache if present, else fetch the whole table once and cache it.
-    Kept close to the original, but always returns a DateTime-sorted frame so downstream
-    diff/rolling math is well-defined.
+    Non-blocking incremental pull for one DB. Returns (wide_df, new_watermark, error).
+
+    Exports only decoded scans with DateTime >= watermark, formats them to wide channel
+    rows, then keeps strictly-new scans (DateTime > watermark). new_watermark is the max
+    DateTime of the returned rows (unchanged if nothing new). max_rows caps the number of
+    new wide rows appended in one cycle (0/None = no cap).
     """
-    if os.path.exists(cache_filename):
-        df = pd.read_csv(cache_filename, parse_dates=["DateTime"])
-    else:
-        query = text(f"SELECT * FROM {table} ORDER BY DateTime ASC")
-        with engine.connect() as conn:
-            df = pd.read_sql_query(query, conn)
-        df.to_csv(cache_filename, index=False)
-    if "DateTime" in df.columns:
-        df = df.sort_values("DateTime").reset_index(drop=True)
-    return df
+    try:
+        long_path = _pull_decoded_long(
+            cfg, _decoded_base(cfg, "delta"), datetime_filter=watermark, chunksize=None
+        )
+        wide = _long_csv_to_wide(long_path)
+    except Exception as e:
+        return pd.DataFrame(), watermark, str(e)
+
+    if wide.empty:
+        return pd.DataFrame(), watermark, None
+
+    if watermark:
+        wm_ts = pd.to_datetime(watermark)
+        wide = wide[wide["DateTime"] > wm_ts]
+    if wide.empty:
+        return pd.DataFrame(), watermark, None
+
+    wide = wide.sort_values("DateTime").reset_index(drop=True)
+    if max_rows:
+        wide = wide.iloc[: int(max_rows)]
+
+    new_wm = wide["DateTime"].max().isoformat()
+    return wide, new_wm, None
+
+
+def initial_watermark(buffer_df: pd.DataFrame) -> str:
+    """ISO high-water mark from an existing buffer, or the epoch if empty."""
+    if buffer_df is not None and not buffer_df.empty and "DateTime" in buffer_df.columns:
+        return pd.to_datetime(buffer_df["DateTime"]).max().isoformat()
+    return "1970-01-01T00:00:00"
 
 
 def _append_to_cache(new_batch: pd.DataFrame, cache_filename: str):
     """
-    Append rows to the CSV cache WITHOUT risking column misalignment.
-
-    The original `to_csv(mode='a', header=False)` trusts that batch column order
-    matches the file's header forever. Here we read the existing header (cheap: one
-    row) and reindex the batch to it before appending. Missing columns become NaN
-    instead of shifting every subsequent value into the wrong column.
+    Append rows to the wide CSV cache without risking column misalignment: reindex the
+    batch to the existing header first, so a new/missing channel becomes NaN instead of
+    shifting every subsequent value into the wrong column.
     """
     if not os.path.exists(cache_filename):
+        _ensure_parent_dir(cache_filename)
         new_batch.to_csv(cache_filename, index=False)
         return
     try:
@@ -133,56 +173,12 @@ def _append_to_cache(new_batch: pd.DataFrame, cache_filename: str):
         pass
 
 
-def poll_new_data(engine, table, watermark, columns=None, max_rows=None):
-    """
-    Non-blocking single poll: fetch every row with DateTime strictly greater than
-    `watermark`, ordered ascending. Returns (dataframe, new_watermark, error_str).
-
-    - dataframe: new rows (possibly empty).
-    - new_watermark: updated ISO high-water mark (unchanged if nothing new).
-    - error_str: None on success, else a short message for the UI.
-
-    `columns` may be an explicit list to SELECT; None means SELECT *.
-    """
-    if columns:
-        # De-dupe while preserving order; guarantee DateTime is present and first.
-        seen, ordered = set(), []
-        for c in ["DateTime"] + list(columns):
-            if c not in seen:
-                seen.add(c)
-                ordered.append(c)
-        col_sql = ", ".join(ordered)
-    else:
-        col_sql = "*"
-
-    top_sql = f"TOP {int(max_rows)} " if max_rows else ""
-    query = text(
-        f"SELECT {top_sql}{col_sql} FROM {table} WHERE DateTime > :last_dt ORDER BY DateTime ASC"
-    )
-    try:
-        with engine.connect() as conn:
-            df = pd.read_sql_query(query, conn, params={"last_dt": watermark})
-        if not df.empty:
-            new_wm = pd.to_datetime(df["DateTime"]).max().isoformat()
-            return df, new_wm, None
-        return df, watermark, None
-    except Exception as e:
-        return pd.DataFrame(), watermark, str(e)
-
-
-def initial_watermark(buffer_df: pd.DataFrame) -> str:
-    """ISO high-water mark from an existing buffer, or the epoch if empty."""
-    if buffer_df is not None and not buffer_df.empty and "DateTime" in buffer_df.columns:
-        return pd.to_datetime(buffer_df["DateTime"]).max().isoformat()
-    return "1970-01-01T00:00:00"
-
-
 def append_batch(buffer_df: pd.DataFrame, new_batch: pd.DataFrame, cache_filename: str,
                  max_buffer_rows: int | None = None) -> pd.DataFrame:
     """
-    Append a new batch to the in-memory buffer AND the on-disk cache, keeping the
-    buffer sorted by DateTime and (optionally) bounded to the most recent
-    `max_buffer_rows` so a long-running live session can't grow without limit.
+    Append a new batch to the in-memory buffer AND the wide CSV cache, keeping the buffer
+    DateTime-sorted, de-duplicated on DateTime, and optionally bounded to the most recent
+    `max_buffer_rows` so a long-running session can't grow without limit.
     """
     _append_to_cache(new_batch, cache_filename)
     combined = pd.concat([buffer_df, new_batch], ignore_index=True)

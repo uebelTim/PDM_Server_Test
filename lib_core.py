@@ -273,7 +273,7 @@ def solve_rul_root(func, params, target_val, t_max, get_dynamic_std, sigma_facto
         return brentq(target_equation, 1e-9, hi, xtol=1e-9, maxiter=200) * t_max
     except: return None
 
-def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thresholds=None, precomputed_params=None, sigma_factor=1.645, channel_name="", smoothed_rul=None):
+def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thresholds=None, precomputed_params=None, sigma_factor=1.645, channel_name="", smoothed_rul=None, x_origin=None):
     time_arr, sensor_arr, sensor_raw_arr = np.asarray(time_raw, dtype=float), np.asarray(sensor_smooth, dtype=float), np.asarray(sensor_raw, dtype=float)
     t_max = np.max(time_arr) if np.max(time_arr) > 0 else 1.0
     time_norm = time_arr / t_max
@@ -313,11 +313,22 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     smooth_preds = func(time_smooth_norm, *params)
     dynamic_std_smooth = get_dynamic_std(time_smooth_norm)
 
+    # When an x_origin (a DateTime) is supplied, plot the x-axis as real calendar dates
+    # (origin + elapsed days) instead of elapsed-day floats; the fit's future tail then
+    # lands on future dates. Without it the behavior is unchanged (elapsed days).
+    if x_origin is not None:
+        x_origin = pd.Timestamp(x_origin)
+        x_raw = x_origin + pd.to_timedelta(time_arr, unit='D')
+        x_smooth = x_origin + pd.to_timedelta(time_smooth_converted, unit='D')
+        x_axis_title = "DateTime"
+    else:
+        x_raw, x_smooth, x_axis_title = time_arr, time_smooth_converted, "Elapsed Days"
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=time_arr, y=sensor_raw_arr, mode='markers', name='Raw Data', marker=dict(color='gray', size=5, opacity=0.7)))
-    fig.add_trace(go.Scatter(x=time_smooth_converted, y=smooth_preds, mode='lines', name=f'{model_choice} Fit', line=dict(color='blue', width=2.5)))
-    fig.add_trace(go.Scatter(x=time_smooth_converted, y=smooth_preds - (dynamic_std_smooth * sigma_factor), mode='lines', line=dict(width=0), showlegend=False))
-    fig.add_trace(go.Scatter(x=time_smooth_converted, y=smooth_preds + (dynamic_std_smooth * sigma_factor), mode='lines', fill='tonexty', fillcolor='rgba(0, 0, 255, 0.15)', name='Confidence Band', line=dict(width=0)))
+    fig.add_trace(go.Scatter(x=x_raw, y=sensor_raw_arr, mode='markers', name='Raw Data', marker=dict(color='gray', size=5, opacity=0.7)))
+    fig.add_trace(go.Scatter(x=x_smooth, y=smooth_preds, mode='lines', name=f'{model_choice} Fit', line=dict(color='blue', width=2.5)))
+    fig.add_trace(go.Scatter(x=x_smooth, y=smooth_preds - (dynamic_std_smooth * sigma_factor), mode='lines', line=dict(width=0), showlegend=False))
+    fig.add_trace(go.Scatter(x=x_smooth, y=smooth_preds + (dynamic_std_smooth * sigma_factor), mode='lines', fill='tonexty', fillcolor='rgba(0, 0, 255, 0.15)', name='Confidence Band', line=dict(width=0)))
     
     if thresholds:
         for thresh in thresholds: fig.add_hline(y=thresh, line_dash="dash", line_color="red", annotation_text=f"Target: {thresh}")
@@ -357,12 +368,16 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     
     fig.update_layout(
         title=f"RUL Prediction — Channel {channel_name} | Best Fit: {model_choice}",
-        xaxis_title="Elapsed Days", 
+        xaxis_title=x_axis_title,
         yaxis_title="Sensor Value",
         yaxis=dict(range=[absolute_y_min - y_padding, absolute_y_max + y_padding]),
-        template="plotly_white", 
+        template="plotly_white",
         margin=dict(t=50, b=50, l=50, r=50)
     )
+    # On a datetime axis, force day-level tick/hover labels so ticks read e.g.
+    # "2026-01-14" instead of collapsing to just the month.
+    if x_origin is not None:
+        fig.update_xaxes(tickformat="%Y-%m-%d", hoverformat="%Y-%m-%d")
     return fig, pd.Series(dtype=float), pd.DataFrame(rul_records)
 
 
@@ -372,16 +387,33 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
 def _now_iso():
     return datetime.now().astimezone().isoformat(timespec='seconds')
 
-def build_custom_telegram(channel, status, nominal_rul_days=None, early_rul_days=None, late_rul_days=None, sigma_factor=1.645, limit_value=0.2, best_model="Unknown"):
+def build_custom_telegram(channel, status, nominal_rul_days=None, early_rul_days=None, late_rul_days=None, sigma_factor=1.645, limit_value=0.2, best_model="Unknown", event_timestamp=None, gauge_number=None):
     cdf = 0.5 * (1.0 + math.erf(sigma_factor / (2 ** 0.5)))
 
     def _to_duration(rul): return f"P{max(0, int(round(float(rul))))}D" if not pd.isna(rul) and rul is not None else None
-    def _num(x): return round(float(x), 2) if not pd.isna(x) and x is not None else None
+    def _num(x):
+        # RUL day count for the wire payload. The server rejects both negative numbers
+        # and null, so:
+        #   * 'Safe' / no-crossing bands arrive here as None -> saturate at RUL_HORIZON
+        #     (a long life), which also keeps the band ordering early <= nominal <= late
+        #     valid instead of collapsing an optimistic band to 0.
+        #   * breached channels carry SENTINEL_ALREADY_REACHED (-999) / negative RULs,
+        #     meaning "0 days remaining" -> clamp to 0.
+        if x is None or pd.isna(x):
+            return float(RUL_HORIZON)
+        try:
+            return max(0.0, round(float(x), 2))
+        except (TypeError, ValueError):
+            return float(RUL_HORIZON)
 
     return {
         "type": "pdm_status_changed",
-        "timestamp": _now_iso(),
-        "gaugeNumber": GAUGE_NUMBER,
+        # When the status change actually occurred (e.g. the historical moment a channel
+        # breached the limit), not when this telegram was built. Defaults to now.
+        "timestamp": event_timestamp or _now_iso(),
+        # Which gauge/system this alert is for. The live page monitors several databases,
+        # each its own gauge, so it passes the per-DB number; defaults to GAUGE_NUMBER.
+        "gaugeNumber": str(gauge_number) if gauge_number is not None else GAUGE_NUMBER,
         "status": status,
         "component": {
             "type": "ionization_chamber_kg20/10",
