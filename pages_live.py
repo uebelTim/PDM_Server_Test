@@ -65,7 +65,7 @@ def get_db_registry():
             "table": "ValuesHotMillProfileGaugeService",
             "username": shared_user,
             "password": shared_password,
-            "cache_file": f"{s['key']}_cache.csv",
+            "cache_file": f"data/{s['key']}_cache.csv",
         }
         for s in sources
     ]

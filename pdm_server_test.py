@@ -4,12 +4,11 @@ app.py — Entry point for the Machine Health dashboard (multipage).
 Run with:  streamlit run app.py
 
 Pages:
-    • Time-Travel Simulator  — the original CSV-driven simulator (pages_simulator.py)
+    • Historical backtesting  — the original CSV-driven simulator (pages_simulator.py)
     • Live Monitoring        — new multi-database live streaming + RUL events (pages_live.py)
 
 Both pages import their shared math/Telegram logic from lib_core.py, so there is a
-single source of truth for the algorithm. set_page_config lives here (it must be the
-first Streamlit call and may only run once per session).
+single source of truth for the algorithm.
 """
 import streamlit as st
 
